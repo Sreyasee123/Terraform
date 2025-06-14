@@ -6,7 +6,7 @@
 #!/bin/bash
 ## The Storage account name must be unique, and the values below should match your backend.tf
 RESOURCE_GROUP_NAME=demo-resources
-STORAGE_ACCOUNT_NAME=techtutorialswithpiyush
+STORAGE_ACCOUNT_NAME=tech
 CONTAINER_NAME=prod-tfstate
 
 # Create resource group
