@@ -1,0 +1,81 @@
+# Define the input CSV file path
+$inputFile = "AZData.csv"
+
+# Import CSV data
+$data = Import-Csv -Path $inputFile
+
+# Function to get unused IPs in a subnet
+function Get-UnusedIPs {
+    param (
+        [string]$vNetName,
+        [string]$subnetName,
+        [string]$targetVNetResourceGroup
+    )
+    $vNet = Get-AzVirtualNetwork -Name $vNetName -ResourceGroupName $targetVNetResourceGroup
+    if (-not $vNet) {
+        Write-Host "Virtual Network $vNetName not found in resource group $targetVNetResourceGroup"
+        return @()
+    }
+    $subnet = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $vNet -Name $subnetName
+    if (-not $subnet) {
+        Write-Host "Subnet $subnetName not found in Virtual Network $vNetName"
+        return @()
+    }
+    $usedIPs = Get-AzNetworkInterface | Where-Object { $_.IpConfigurations.Subnet.Id -eq $subnet.Id } | Select-Object -ExpandProperty IpConfigurations | Select-Object -ExpandProperty PrivateIpAddress
+    
+    # Fetch Load Balancer frontend IPs in the subnet
+    $lbIPs = Get-AzLoadBalancer | ForEach-Object {
+        $_.FrontendIpConfigurations | Where-Object { $_.Subnet.Id -eq $subnet.Id } | Select-Object -ExpandProperty PrivateIpAddress
+    }
+    
+    $reservedIPs = @(".0", ".1", ".2", ".3") # Azure reserved range
+    $subnetPrefix = $subnet.AddressPrefix.Split('/')[0]
+    $subnetBase = $subnetPrefix.Substring(0, $subnetPrefix.LastIndexOf('.') + 1)
+    $availableIPs = @()
+    
+    for ($i = 4; $i -lt 255; $i++) {  # Start from 4 to avoid Azure-reserved IPs
+        $ip = "$subnetBase$i"
+        if ($ip -notin $usedIPs -and $ip -notin $lbIPs -and $ip -notmatch "($reservedIPs)") {
+            $availableIPs += $ip
+        }
+    }
+    return $availableIPs
+}
+
+# Iterate through each row in the CSV
+foreach ($row in $data) {
+    $subscriptionName = $row."Target Subscription Name"
+    $serverName = $row.ServerName
+    $resourceGroup = $row."Target Resource Group"
+    $vNetName = $row."Target VNet"
+    $subnetName = $row."Target Subnet"
+    $targetVNetResourceGroup = $row."Target VNET Resource Group"
+    $region = $row."Azure Region"
+    $ipCount = [int]$row."IP Count"
+    
+    # Set the Azure subscription
+    Set-AzContext -Subscription $subscriptionName
+    
+    # Get unused IPs from the subnet
+    $availableIPs = Get-UnusedIPs -vNetName $vNetName -subnetName $subnetName -targetVNetResourceGroup $targetVNetResourceGroup
+    if ($availableIPs.Count -lt $ipCount) {
+        Write-Host "Not enough available IPs in subnet $subnetName for $serverName"
+        continue
+    }
+    
+    # NIC Name following convention
+    $nicName = "nic-$serverName-00"
+    
+    # Create NIC Configuration
+    $ipConfigs = @()
+    for ($i = 0; $i -lt $ipCount; $i++) {
+        $subnetId = (Get-AzVirtualNetworkSubnetConfig -VirtualNetwork (Get-AzVirtualNetwork -Name $vNetName -ResourceGroupName $targetVNetResourceGroup) -Name $subnetName).Id
+        $isPrimary = ($i -eq 0)  # Mark the first IP configuration as primary
+        $ipConfig = New-AzNetworkInterfaceIpConfig -Name "ipConfig$i" -SubnetId $subnetId -PrivateIpAddress $availableIPs[$i] -PrivateIpAddressVersion IPv4 -Primary:$isPrimary
+        $ipConfigs += $ipConfig
+    }
+    
+    # Create NIC in the target resource group
+    New-AzNetworkInterface -Name $nicName -ResourceGroupName $resourceGroup -Location $region -IpConfiguration $ipConfigs
+    Write-Host "NIC $nicName created successfully in subscription $subscriptionName with $ipCount IPs."
+}

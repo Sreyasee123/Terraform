@@ -1,0 +1,83 @@
+# Define the input file path containing the list of server names
+$inputFilePath = "C:\temp\servers.txt"  # Replace with the actual path to your input file
+
+# Define the output directory path to store group members information
+$outputPath = "C:\temp\members"  # Replace with the desired output directory path
+
+# Ensure the output directory exists
+if (-not (Test-Path -Path $outputPath)) {
+    New-Item -Path $outputPath -ItemType Directory
+}
+
+# Read server names from the input file
+$serverList = Get-Content -Path $inputFilePath
+
+# Loop through each server in the list (but this will be local)
+foreach ($server in $serverList) {
+    # Define the text file path for the current server with the new naming convention
+    $serverFilePath = "$outputPath\$server" + "_users.txt"
+
+    Write-Host "Fetching groups and members for server: $server"
+
+    # Fetch the list of local groups on the current server using 'net localgroup'
+    try {
+        # Use 'net localgroup' to fetch the groups locally (no remote login)
+        $groups = net localgroup
+
+        if ($groups.Count -eq 0) {
+            Write-Warning "No local groups found on server '$server'."
+        }
+
+        # Create a file to store the group members information
+        Add-Content -Path $serverFilePath -Value "Server: $server"
+        Add-Content -Path $serverFilePath -Value "========================="
+
+        # Loop through each group to fetch its members
+        foreach ($group in $groups) {
+            $groupName = $group.Trim()
+
+            # Skip irrelevant output like headers or empty lines
+            if ($groupName -ne "" -and $groupName -notmatch "Group name|The command completed successfully.") {
+                # Remove the '*' from the group name if it exists
+                $cleanGroupName = $groupName.Trim().TrimStart('*').Trim()
+
+                Write-Host "Fetching members for group: $cleanGroupName"
+
+                # Fetch the group members using 'net localgroup <groupName>'
+                try {
+                    $membersList = net localgroup $cleanGroupName
+
+                    # Filter out unnecessary lines (headers, footers, and empty lines)
+                    $cleanMembers = $membersList | Where-Object { $_ -notmatch '^(The command completed successfully|Group name|Comment|-----|$)' }
+
+                    # If there are no members, set it to "No members"
+                    if ($cleanMembers.Count -eq 0) {
+                        $cleanMembers = @("No members")
+                    }
+
+                    # Write the group name and members to the file
+                    Add-Content -Path $serverFilePath -Value "Group: $cleanGroupName"
+                    Add-Content -Path $serverFilePath -Value "Members:"
+
+                    # Loop through and add each member to the file
+                    foreach ($member in $cleanMembers) {
+                        Add-Content -Path $serverFilePath -Value $member
+                    }
+
+                    # Add a separator for readability
+                    Add-Content -Path $serverFilePath -Value "========================="
+                }
+                catch {
+                    Write-Warning "Failed to fetch members for group '$cleanGroupName' on server '$server'."
+                    Add-Content -Path $serverFilePath -Value "Group: $cleanGroupName"
+                    Add-Content -Path $serverFilePath -Value "Members: Failed to fetch members"
+                }
+            }
+        }
+    }
+    catch {
+        Write-Warning "Failed to fetch groups for server '$server'."
+    }
+}
+
+Write-Host "Group member information has been saved to $outputPath."

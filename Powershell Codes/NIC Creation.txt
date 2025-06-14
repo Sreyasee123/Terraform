@@ -1,0 +1,136 @@
+Connect-AzAccount
+
+# Define the input and output CSV file paths
+$inputFile = "C:\Users\r7YGSH7K\Downloads\MG10 NIC 1.csv"
+$outputFile = "C:\Users\r7YGSH7K\Downloads\NIC_Details_up.csv"
+
+$data = Import-Csv -Path $inputFile
+$nicDetails = @()
+
+# Function to get the next available IP in the subnet range
+function Get-NextIP {
+    param ([IPAddress]$currentIP, [string]$subnetRange)
+    
+    $subnet = [System.Net.IPAddress]::Parse(($subnetRange -split '/')[0])
+    $mask = [int]($subnetRange -split '/')[1]
+    
+    $bytes = $currentIP.GetAddressBytes()
+    $subnetBytes = $subnet.GetAddressBytes()
+    
+    if ($bytes[3] -ge 253) {
+        $bytes[3] = 4
+        $bytes[2]++
+    } else {
+        $bytes[3]++
+    }
+    
+    $newIP = [IPAddress]::Parse(($bytes -join '.'))
+    
+    # Ensure new IP is within the subnet range
+    if ($newIP.GetAddressBytes()[2] -ne $subnetBytes[2]) {
+        return $null
+    }
+    return $newIP
+}
+
+# Get used IPs (NICs + Load Balancers)
+function Get-UsedIPs {
+    param ($subnetId)
+    
+    $nicIPs = Get-AzNetworkInterface | Where-Object {
+        $_.IpConfigurations.Subnet.Id -eq $subnetId
+    } | Select-Object -ExpandProperty IpConfigurations | Select-Object -ExpandProperty PrivateIpAddress
+    
+    $lbIPs = Get-AzLoadBalancer | ForEach-Object {
+        $_.FrontendIpConfigurations | Where-Object {
+            $_.Subnet.Id -eq $subnetId
+        } | Select-Object -ExpandProperty PrivateIpAddress
+    }
+    
+    return $nicIPs + $lbIPs
+}
+
+# MAIN LOOP
+foreach ($row in $data) {
+    $subscriptionName = $row."Target Subscription Name"
+    $serverName = $row.ServerName
+    $resourceGroup = $row."Target Resource Group"
+    $vNetName = $row."Target VNet"
+    $subnetName = $row."Target Subnet"
+    $targetVNetResourceGroup = $row."Target VNET Resource Group"
+    $region = $row."Azure Region"
+    $ipCount = [int]$row."IP Count"
+    $subnetRange = $row."Target Subnet Range"
+    
+    Set-AzContext -Subscription $subscriptionName
+    
+    $vNet = Get-AzVirtualNetwork -Name $vNetName -ResourceGroupName $targetVNetResourceGroup
+    $subnet = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $vNet -Name $subnetName
+    $subnetId = $subnet.Id
+    
+    $usedIPs = Get-UsedIPs -subnetId $subnetId
+    
+    # Start IP dynamically from subnet range
+    $currentStaticIP = [IPAddress]::Parse(($subnetRange -split '/')[0])
+    
+    # Find next available static IP
+    $availableIPs = @()
+    while ($availableIPs.Count -lt $ipCount) {
+        $ipStr = $currentStaticIP.ToString()
+        if ($ipStr -notin $usedIPs) {
+            $availableIPs += $ipStr
+        }
+        $currentStaticIP = Get-NextIP -currentIP $currentStaticIP -subnetRange $subnetRange
+        if (-not $currentStaticIP) {
+            Write-Warning "Exceeded subnet range while finding IPs."
+            break
+        }
+    }
+    
+    if ($availableIPs.Count -lt $ipCount) {
+        Write-Warning "Not enough valid IPs for $serverName. Skipping..."
+        continue
+    }
+    
+    $nicName = "nic-$serverName-00"
+    Write-Host "Available IPs for ${nicName}: $($availableIPs -join ', ')"
+    
+    $ipConfigs = @()
+    $validIPAssignment = $true
+    
+    for ($i = 0; $i -lt $ipCount; $i++) {
+        $ipToAssign = $availableIPs[$i]
+        if ([string]::IsNullOrWhiteSpace($ipToAssign)) {
+            Write-Warning "Invalid IP at index $i for ${nicName}. Skipping NIC creation."
+            $validIPAssignment = $false
+            break
+        }
+        
+        Write-Host "Assigning IP $ipToAssign to NIC ${nicName}"
+        
+        $ipConfig = New-AzNetworkInterfaceIpConfig -Name "ipConfig$i" -SubnetId $subnetId `
+                      -PrivateIpAddress $ipToAssign -PrivateIpAddressVersion IPv4 -Primary:($i -eq 0)
+        $ipConfigs += $ipConfig
+    }
+    
+    if ($validIPAssignment -and $ipConfigs.Count -eq $ipCount) {
+        New-AzNetworkInterface -Name $nicName -ResourceGroupName $resourceGroup `
+            -Location $region -IpConfiguration $ipConfigs
+        Write-Host "NIC ${nicName} created with IPs: $($availableIPs -join ', ')"
+        
+        $nicDetails += [PSCustomObject]@{
+            "Server Name" = $serverName
+            "NIC Name"    = $nicName
+            "IP Details"  = ($ipConfigs | Select-Object -ExpandProperty PrivateIpAddress) -join ", "
+        }
+    } else {
+        Write-Warning "NIC ${nicName} NOT created due to IP assignment issues."
+    }
+}
+
+# Export results
+$nicDetails | Export-Csv -Path $outputFile -NoTypeInformation
+Write-Host "NIC details exported to $outputFile."
+
+
+

@@ -1,0 +1,154 @@
+# Define input and output paths
+$inputFilePath = "C:\temp\ServerList.txt"  # Path to the text file containing server names
+$baseFolderPath = "C:\temp\ServerInfo"     # Base folder for storing server information
+$ipConfigOutputPath = Join-Path $baseFolderPath "IPConfig"
+$netStatOutputPath = Join-Path $baseFolderPath "NetStat"
+$vendorDetailsOutputPath = Join-Path $baseFolderPath "VendorDetails"
+$serviceDetailsOutputPath = Join-Path $baseFolderPath "Services"
+
+# Ensure the output folders exist
+foreach ($folder in @($ipConfigOutputPath, $netStatOutputPath, $vendorDetailsOutputPath, $serviceDetailsOutputPath)) {
+    if (-Not (Test-Path -Path $folder)) {
+        New-Item -ItemType Directory -Path $folder | Out-Null
+    }
+}
+
+# Function to fetch server information
+function Get-ServerInfo {
+    param (
+        [string]$server
+    )
+
+    # Ensure the server folder exists
+    $serverFolderPath = Join-Path -Path $baseFolderPath -ChildPath $server
+    if (-Not (Test-Path -Path $serverFolderPath)) {
+        New-Item -ItemType Directory -Path $serverFolderPath | Out-Null
+    }
+
+    # Define output files for server info
+    $serverInfoFile = Join-Path -Path $serverFolderPath -ChildPath "ServerInfo.txt"
+    $ipConfigFile = Join-Path -Path $serverFolderPath -ChildPath "$server-IPConfig.txt"
+    $netStatFile = Join-Path -Path $serverFolderPath -ChildPath "$server-Netstat.txt"
+    $vendorDetailsFile = Join-Path -Path $serverFolderPath -ChildPath "$server-VendorDetails.csv"
+    $errorLogFile = Join-Path -Path $serverFolderPath -ChildPath "ErrorLog.txt"
+
+    # Start collecting information
+    try {
+        # Fetch system information using Get-WmiObject
+        $fqdn = (Get-WmiObject -Class Win32_ComputerSystem -ComputerName $server).DNSHostName
+        $osInfo = (Get-WmiObject -Class Win32_OperatingSystem -ComputerName $server).Caption
+        $diskDetails = Get-WmiObject -Class Win32_LogicalDisk -Filter "DriveType = 3" -ComputerName $server | Select-Object DeviceID, Size, FreeSpace
+        $ipAddress = (Get-WmiObject -Class Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True" -ComputerName $server).IPAddress
+        $lastPatchingDate = (Get-WmiObject -Class Win32_OperatingSystem -ComputerName $server).LastBootUpTime
+        $adminUsers = Get-WmiObject -Class Win32_UserAccount -ComputerName $server | Where-Object { $_.LocalAccount -eq $true -and $_.SIDType -eq 1 } | Select-Object -ExpandProperty Name
+        $sharedDriveDetails = Get-WmiObject -Class Win32_Share -ComputerName $server | Select-Object Name, Path, Description
+        $networkInfo = Get-WmiObject -Class Win32_NetworkAdapterConfiguration -ComputerName $server | Where-Object { $_.IPEnabled -eq $true } | Select-Object Description, MACAddress, IPAddress, DefaultIPGateway
+        $installedSoftware = Get-WmiObject -Class Win32_Product -ComputerName $server
+
+        # Fetch SQL Server version
+        $sqlVersionOutput = "No SQL Server Installed"
+        $services = Invoke-Command -ComputerName $server -ScriptBlock { Get-Service -Name 'MSSQL*' -ErrorAction SilentlyContinue }
+        if ($services) {
+            try {
+                $sqlVersionOutput = Invoke-Command -ComputerName $server -ScriptBlock {
+                    Invoke-Sqlcmd -Query "SELECT @@VERSION" -ServerInstance "localhost" -ErrorAction Stop
+                } | Select-Object -ExpandProperty Column1 -ErrorAction Stop
+            } catch {
+                $sqlVersionOutput = "Error fetching SQL Version"
+            }
+        }
+
+        # Collect services information
+        $serviceInfo = Get-Service -ComputerName $server | Select-Object Name, Status
+
+        # Create a nicely formatted string for server information
+        $serverInfo = @"
+===========================================
+           Server Information for $server
+===========================================
+
+FQDN: $fqdn
+
+OS Version: $osInfo
+
+SQL Version: $sqlVersionOutput
+
+===========================================
+               Disk Details
+===========================================
+$($diskDetails | ForEach-Object { "$($_.DeviceID): Size: $([math]::round($_.Size / 1GB, 2)) GB, Free Space: $([math]::round($_.FreeSpace / 1GB, 2)) GB" }) -join "`n")
+
+===========================================
+          Server IP and Patching Info
+===========================================
+Server IP Address: $($ipAddress -join ', ')
+Last Patching Date: $lastPatchingDate
+
+===========================================
+             Admin Users
+===========================================
+$($adminUsers -join ', ')
+
+===========================================
+            Shared Drives
+===========================================
+$($sharedDriveDetails | ForEach-Object { "$($_.Name): $($_.Path)" }) -join "`n"
+
+===========================================
+             Network Information
+===========================================
+$($networkInfo | ForEach-Object { "$($_.Description): IP: $($_.IPAddress), MAC: $($_.MACAddress), Gateway: $($_.DefaultIPGateway)" }) -join "`n"
+
+===========================================
+        Installed Software and Versions
+===========================================
+$($installedSoftware | ForEach-Object { "$($_.Name) (Version: $($_.Version))" }) -join "; "
+
+===========================================
+               Services Status
+===========================================
+$($serviceInfo | ForEach-Object { "$($_.Name): $($_.Status)" }) -join "`n"
+
+"@
+
+        # Write the server information to the file
+        $serverInfo | Out-File -FilePath $serverInfoFile -Encoding UTF8
+
+        # Collect ipconfig /all details
+        $ipconfigOutput = Invoke-Command -ComputerName $server -ScriptBlock { ipconfig /all }
+        $ipconfigFilePath = "$ipConfigOutputPath\$server-IPConfig.txt"
+        $ipconfigOutput | Out-File -FilePath $ipconfigFilePath
+
+        # Collect netstat output
+        $netstatOutput = Invoke-Command -ComputerName $server -ScriptBlock { netstat -an }
+        $netstatFilePath = "$netStatOutputPath\$server-Netstat.txt"
+        $netstatOutput | Out-File -FilePath $netstatFilePath
+
+        # Collect installed software and vendor details
+        $softwareAndVendor = Invoke-Command -ComputerName $server -ScriptBlock {
+            Get-WmiObject -Class Win32_Product | Select-Object Name, Version, Vendor
+        }
+
+        # Save software and vendor details to a CSV file
+        $softwareCsvFilePath = "$vendorDetailsOutputPath\$server-VendorDetails.csv"
+        $softwareAndVendor | Export-Csv -Path $softwareCsvFilePath -NoTypeInformation -Encoding UTF8
+
+        # Save service details to the services folder (not inside individual server folder)
+        $serviceDetailsFile = Join-Path -Path $serviceDetailsOutputPath -ChildPath "$server-Services.txt"
+        $serviceInfo | Out-File -FilePath $serviceDetailsFile -Encoding UTF8
+
+        Write-Host "Details for $server saved successfully."
+
+    } catch {
+        "Failed to fetch details for ${server}: $($_.Exception.Message)" | Out-File -FilePath $errorLogFile -Append
+        Write-Host "Failed to fetch details for ${server}: $($_.Exception.Message)"
+    }
+}
+
+# Read the server names from the input file and fetch details for each
+$serverList = Get-Content -Path $inputFilePath
+foreach ($server in $serverList) {
+    Get-ServerInfo -server $server
+}
+
+Write-Host "All server details saved to $baseFolderPath"

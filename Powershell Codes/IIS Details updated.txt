@@ -1,0 +1,73 @@
+﻿# Define file paths
+$inputFilePath = "C:\temp\Servers.txt"  # Input file with server names
+$iisOutputPath = "C:\temp\Output\IISDetails"         # Output folder for IIS details
+
+# Ensure the output folder exists
+if (!(Test-Path -Path $iisOutputPath)) {
+    New-Item -ItemType Directory -Path $iisOutputPath
+}
+
+# Read server names from input file
+$servers = Get-Content -Path $inputFilePath
+
+# Loop through server list
+foreach ($server in $servers) {
+    Write-Host "Processing server: $server"
+
+    # Check if IIS role is installed
+    $iisRoleInstalled = Invoke-Command -ComputerName $server -ScriptBlock {
+        (Get-WindowsFeature -Name Web-Server).Installed
+    }
+
+    # Collect IIS details if installed
+    if ($iisRoleInstalled) {
+        $iisDetailsFilePath = "$iisOutputPath\$server-IIS.txt"
+        $iisDetails = Invoke-Command -ComputerName $server -ScriptBlock {
+            Import-Module WebAdministration
+            # Get details for all IIS sites and their bindings
+            $websites = Get-Website
+            $websites | ForEach-Object {
+                $site = $_
+                $site.Bindings.Collection | ForEach-Object {
+                    $bindingInfo = $_.bindingInformation -split ':'
+                    $hostName = if ($bindingInfo.Length -eq 3) { $bindingInfo[2] } else { "No HostName" }
+
+                    [PSCustomObject]@{
+                        ServerName      = $env:COMPUTERNAME  # Get the server name from the environment
+                        SiteName        = $site.Name
+                        State           = $site.State
+                        PhysicalPath    = $site.PhysicalPath
+                        BindingIPAddress = $bindingInfo[0]
+                        BindingPort      = $bindingInfo[1]
+                        BindingProtocol  = $_.protocol
+                        BindingHostName  = $hostName
+                    }
+                }
+            }
+        }
+
+        # Check if IIS details were retrieved
+        if ($iisDetails) {
+            Write-Host "IIS details found for $server"
+
+            # Write IIS details to the file
+            $iisDetails | ForEach-Object {
+                Add-Content -Path $iisDetailsFilePath -Value "Site Name: $($_.SiteName)"
+                Add-Content -Path $iisDetailsFilePath -Value "State: $($_.State)"
+                Add-Content -Path $iisDetailsFilePath -Value "Physical Path: $($_.PhysicalPath)"
+                Add-Content -Path $iisDetailsFilePath -Value "Bindings:"
+                Add-Content -Path $iisDetailsFilePath -Value "  IP Address: $($_.BindingIPAddress)"
+                Add-Content -Path $iisDetailsFilePath -Value "  Port: $($_.BindingPort)"
+                Add-Content -Path $iisDetailsFilePath -Value "  Protocol: $($_.BindingProtocol)"
+                Add-Content -Path $iisDetailsFilePath -Value "  HostName: $($_.BindingHostName)"
+                Add-Content -Path $iisDetailsFilePath -Value "========================="
+            }
+        } else {
+            Write-Host "No IIS details found for $server"
+        }
+    } else {
+        Write-Host "IIS is not installed on $server"
+    }
+}
+
+Write-Host "Script execution completed."

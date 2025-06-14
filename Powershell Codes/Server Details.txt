@@ -1,0 +1,160 @@
+# Define the input and output paths
+$inputFilePath = "C:\temp\servers.txt"  
+$outputPath = "C:\temp\Output\SystemReport.csv"          
+$netstatOutputPath = "C:\temp\Output\netstat_output" 
+$ipconfigOutputPath = "C:\temp\Output\ipconfig_output" 
+$vendorDetailsOutputPath = "C:\temp\Output\vendor_details" 
+
+# Ensure the output directories exist
+$directories = @(
+    $netstatOutputPath,
+    $ipconfigOutputPath,
+    $vendorDetailsOutputPath
+)
+foreach ($dir in $directories) {
+    if (-not (Test-Path -Path $dir)) {
+        New-Item -Path $dir -ItemType Directory | Out-Null
+    }
+}
+
+# Import the server names from the TXT file
+$serverList = Get-Content -Path $inputFilePath
+
+# Initialize an array to hold all server reports
+$allReports = @()
+
+# Function to gather server information
+function Get-ServerInfo {
+    param (
+        [string]$server
+    )
+
+    # Initialize variables to store details
+    $adminUsers = @()
+    
+    # Clean server name for file use
+    $cleanedServerName = $server -replace '\..*$', ''
+
+    # Fetch Local Administrators
+    $adminGroupOutput = Invoke-Command -ComputerName $server -ScriptBlock { net localgroup administrators }
+    $adminGroupOutput | ForEach-Object {
+        if ($_ -match '^(.*?)(\s+\((.*?)\))?$') {
+            $userName = $matches[1].Trim()
+            if ($userName -and $userName -ne "Alias name" -and $userName -ne "Comment" -and $userName -ne "The command completed successfully.") {
+                $adminUsers += $userName
+            }
+        }
+    }
+
+    # Fetch FQDN
+    $fqdn = Invoke-Command -ComputerName $server -ScriptBlock { [System.Net.Dns]::GetHostByName($env:COMPUTERNAME).Hostname }
+
+    # Fetch OS Version
+    $osInfo = Invoke-Command -ComputerName $server -ScriptBlock { Get-CimInstance -ClassName Win32_OperatingSystem | Select-Object -ExpandProperty Caption }
+	
+    # Fetch SQL Server Version
+    $services = Invoke-Command -ComputerName $server -ScriptBlock { Get-Service -Name 'MSSQL*' -ErrorAction SilentlyContinue }
+    if ($services) {
+        try {
+            $sqlVersionOutput = Invoke-Command -ComputerName $server -ScriptBlock {
+                Invoke-Sqlcmd -Query "SELECT @@VERSION" -ServerInstance "localhost" -ErrorAction Stop
+            } | Select-Object -ExpandProperty Column1 -ErrorAction Stop
+        } catch {
+            $sqlVersionOutput = "Error fetching SQL Version"
+        }
+    } else {
+        $sqlVersionOutput = "No SQL Server Installed"
+    }
+
+    # Fetch Disk Details
+    $diskInfo = Invoke-Command -ComputerName $server -ScriptBlock {
+        Get-CimInstance -ClassName Win32_LogicalDisk |
+        Where-Object { $_.DriveType -eq 3 -or $_.DriveType -eq 4 } |
+        Select-Object DeviceID,
+            @{Name="Total(GB)";Expression={[math]::round($_.Size/1GB,2)}},
+            @{Name="Free(GB)";Expression={[math]::round($_.FreeSpace/1GB,2)}},
+            @{Name="Used(GB)";Expression={[math]::round(($_.Size - $_.FreeSpace)/1GB,2)}},
+            DriveType
+    }
+
+    $diskDetails = ($diskInfo | ForEach-Object {
+        $driveType = switch ($_.DriveType) {
+            3 { 'Local Disk' }
+            4 { 'Network Disk' }
+            default { 'Unknown' }
+        }
+        "Disk: $($_.DeviceID), Type: $driveType, Total: $($_.'Total(GB)') GB, Used: $($_.'Used(GB)') GB, Free: $($_.'Free(GB)') GB"
+    }) -join '; '
+
+    # Fetch Last Patching Date
+    $patchInfo = Invoke-Command -ComputerName $server -ScriptBlock { Get-HotFix | Select-Object InstalledOn }
+    $lastPatchingDate = $patchInfo | Sort-Object InstalledOn -Descending | Select-Object -First 1 -ExpandProperty InstalledOn
+    if (-not $lastPatchingDate) { $lastPatchingDate = "NA" }
+	
+    # Fetch Shared Drives
+	$sharedDrives = Invoke-Command -ComputerName $server -ScriptBlock {
+   	 Get-WmiObject -Class Win32_Share | Select-Object Name, Path, Type
+	}
+    # Format shared drives details
+	$sharedDriveDetails = ($sharedDrives | ForEach-Object {
+    	"Shared Name: $($_.Name), Path: $($_.Path), Type: $($_.Type)"
+	}) -join '; '
+
+    # Fetch Network Information
+    $networkInfo = Invoke-Command -ComputerName $server -ScriptBlock {
+        Get-NetIPConfiguration | Select-Object -ExpandProperty IPv4Address |
+        ForEach-Object { $_.IPAddress }
+    }
+    $ipAddress = $networkInfo -join ', '
+    $defaultGateway = Invoke-Command -ComputerName $server -ScriptBlock {
+        Get-NetIPConfiguration | Select-Object -ExpandProperty Ipv4DefaultGateway
+    } | ForEach-Object { $_.NextHop }
+
+    # Collect ipconfig /all details
+    $ipconfigOutput = Invoke-Command -ComputerName $server -ScriptBlock { ipconfig /all }
+    $ipconfigFilePath = "$ipconfigOutputPath\$cleanedServerName-IPConfig.txt"
+    $ipconfigOutput | Out-File -FilePath $ipconfigFilePath
+
+    # Collect netstat output
+    $netstatOutput = Invoke-Command -ComputerName $server -ScriptBlock { netstat -an }
+    $netstatFilePath = "$netstatOutputPath\$cleanedServerName-Netstat.txt"
+    $netstatOutput | Out-File -FilePath $netstatFilePath
+
+    # Collect installed software information
+    $installedSoftware = Invoke-Command -ComputerName $server -ScriptBlock { Get-WmiObject -Class Win32_Product | Select-Object Name, Version }
+
+    # Collect installed software and vendor details
+    $softwareAndVendor = Invoke-Command -ComputerName $server -ScriptBlock {
+        Get-WmiObject -Class Win32_Product | Select-Object Name, Version, Vendor
+    }
+    # Save software and vendor details to a CSV file
+    $softwareCsvFilePath = "$vendorDetailsOutputPath\$cleanedServerName-VendorDetails.csv"
+    $softwareAndVendor | Export-Csv -Path $softwareCsvFilePath -NoTypeInformation
+
+    # Return server information
+    return [PSCustomObject]@{
+        'Server Name'        = $cleanedServerName
+        'FQDN'               = $fqdn
+        'OS Version'         = $osInfo
+        'SQL Version'        = $sqlVersionOutput.Trim()
+        'Disk Details'       = $diskDetails
+        'Server IP Address'  = $ipAddress
+        'Last Patching Date' = $lastPatchingDate
+        'Admin Users'        = ($adminUsers -join ', ')
+        'Shared Drives'      = $sharedDriveDetails
+        'Network Info'       = $ipAddress + ", " + $defaultGateway
+        'Installed Software' = ($installedSoftware | ForEach-Object {"$($_.Name) (Version: $($_.Version))"}) -join '; '
+    }
+}
+
+# Loop over each server in the list to collect remote data
+foreach ($server in $serverList) {
+    $serverInfo = Get-ServerInfo -server $server
+    $allReports += $serverInfo
+}
+
+# Export the collected data to CSV
+$allReports | Export-Csv -Path $outputPath -NoTypeInformation
+
+# Output completion message
+Write-Host "System report has been generated at $outputPath"
