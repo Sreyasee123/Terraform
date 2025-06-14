@@ -1,6 +1,6 @@
 # Terraform-AzureDevOps-Sample
 
-### You can use the below Azure cli commands to set the terraform remote backend, or you can do it via the portal
+### below Azure cli commands to set the terraform remote backend, or can do it via the portal
 
 ``` shell
 #!/bin/bash
